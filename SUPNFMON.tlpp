@@ -396,9 +396,8 @@ Static Function ShowBrowse(cAlias, cQuery, cBranch, dDateFrom, dDateTo, cStatusF
     oBrowse:SetUseFilter(.T.)
     oBrowse:SetProfileID(SUPNFMON_PROFILE)
     oBrowse:SetDescription("Notas Fiscais Mais Vendas")
-    oBrowse:SetColumns(aColumns)
-
     AddBrowseLegends(oBrowse)
+    oBrowse:SetColumns(aColumns)
     AddBrowseButtons(;
         oBrowse,;
         oModal,;
@@ -667,11 +666,24 @@ Configura as acoes disponiveis na barra do monitor.
 @type static function
 @author Fabio
 @since 03/08/2026
-@version 1.0
+@version 1.1
 @return Nil
 /*/
 Static Function AddBrowseButtons(oBrowse, oModal, cBranch, dDateFrom, dDateTo, cStatusFilter)
 
+    oBrowse:AddButton(;
+        "Filial",;
+        {|| cBranch := ChangeBranch(;
+            oBrowse,;
+            oModal,;
+            cBranch,;
+            dDateFrom,;
+            dDateTo,;
+            cStatusFilter;
+        )},;
+        ,,,;
+        .F.;
+    )
     oBrowse:AddButton(;
         "Filtros",;
         {|| ChangeFilters(;
@@ -681,19 +693,6 @@ Static Function AddBrowseButtons(oBrowse, oModal, cBranch, dDateFrom, dDateTo, c
             @dDateFrom,;
             @dDateTo,;
             @cStatusFilter;
-        )},;
-        ,,,;
-        .F.;
-    )
-    oBrowse:AddButton(;
-        "Trocar Filial",;
-        {|| cBranch := ChangeBranch(;
-            oBrowse,;
-            oModal,;
-            cBranch,;
-            dDateFrom,;
-            dDateTo,;
-            cStatusFilter;
         )},;
         ,,,;
         .F.;
