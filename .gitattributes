@@ -1,0 +1,10 @@
+*.tlpp text working-tree-encoding=CP1252 eol=crlf
+*.prw  text working-tree-encoding=CP1252 eol=crlf
+*.prg  text working-tree-encoding=CP1252 eol=crlf
+*.prx  text working-tree-encoding=CP1252 eol=crlf
+*.ch   text working-tree-encoding=CP1252 eol=crlf
+*.th   text working-tree-encoding=CP1252 eol=crlf
+
+*.md   text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf

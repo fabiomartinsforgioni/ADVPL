@@ -1,0 +1,13 @@
+.vscode/
+.totvsls/
+.codex-converter-temp/
+
+*.log
+*.ppo
+*.ptm
+*.bak
+*.orig
+*.tmp
+
+Thumbs.db
+.DS_Store

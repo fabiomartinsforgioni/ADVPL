@@ -1,0 +1,1131 @@
+#include "tlpp-core.th"
+#include "totvs.ch"
+#include "topconn.ch"
+
+#define SUPNFMON_VERSION      "3.5"
+#define SUPNFMON_PROFILE      "SNFM"
+#define SUPNFMON_DEFAULT_DAYS 30
+
+#define FILTER_ALL       "Todos"
+#define FILTER_ERROR     "Erros"
+#define FILTER_PENDING   "Pendentes"
+#define FILTER_PROCESSED "Implantadas"
+#define FILTER_CANCELED  "Canceladas"
+
+/*/{Protheus.doc} SUPNFMON
+Monitor de notas fiscais do Mais Vendas.
+
+Apresenta as notas fiscais emitidas com condicao de pagamento configurada
+para o Mais Vendas e o respectivo status de implantacao.
+
+@type user function
+@author Fabio
+@since 27/07/2026
+@version 3.5
+@return Nil
+/*/
+User Function SUPNFMON()
+
+    Local aArea          := FWGetArea()                                         as Array
+    Local cAlias         := GetNextAlias()                                      as Character
+    Local cBranch        := ""                                                  as Character
+    Local cStatusFilter  := FILTER_ALL                                          as Character
+    Local cQuery         := ""                                                  as Character
+    Local dDateFrom      := Date() - SUPNFMON_DEFAULT_DAYS                      as Date
+    Local dDateTo        := Date()                                              as Date
+    Local oError         := Nil                                                 as Object
+
+    Try
+
+        cBranch              := GetCurrentBranch()
+        // O periodo inicial reduz o volume carregado sem impedir consultas
+        // historicas pela janela de filtros.
+        cQuery               := BuildQuery(;
+            "",;
+            cBranch,;
+            dDateFrom,;
+            dDateTo,;
+            cStatusFilter;
+        )
+        ShowBrowse(;
+            cAlias,;
+            cQuery,;
+            cBranch,;
+            dDateFrom,;
+            dDateTo,;
+            cStatusFilter;
+        )
+
+    Catch oError
+
+        FWAlertError(;
+            "Falha ao abrir o Monitor Mais Vendas " + GetSourceBuild() + ":" + CRLF +;
+            AllTrim(oError:Description),;
+            "Monitor Mais Vendas";
+        )
+
+    Finally
+
+        // Libera o alias mesmo quando ocorrer uma excecao.
+        If Select(cAlias) > 0
+            (cAlias)->(DbCloseArea())
+        EndIf
+
+        FWRestArea(aArea)
+
+    EndTry
+
+Return Nil
+
+/*/{Protheus.doc} GetCompanyCode
+Retorna o codigo da empresa utilizado para relacionar a SUPPAYINVOICE.
+
+Antes de utilizar  as variaveis publicas, valida se o ambiente Protheus esta
+preparado com empresa e filial.
+
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 2.1
+@return Character, Codigo da empresa atual
+/*/
+Static Function GetCompanyCode()
+
+    Local cCompany       := ""                                                  as Character
+
+    If Type("cEmpAnt") != "C" .Or. Type("cFilAnt") != "C"
+        UserException(;
+            "Empresa e filial nao estao disponiveis no ambiente atual. " +;
+            "Inicie o SIGAMDI, selecione a empresa e a filial e acesse " +;
+            "o monitor pelo menu.";
+        )
+    EndIf
+
+    cCompany             := cEmpAnt
+
+Return cCompany
+
+/*/{Protheus.doc} GetCurrentBranch
+Retorna a filial ativa depois de validar o ambiente Protheus.
+
+@type static function
+@author Fabio
+@since 30/07/2026
+@version 1.0
+@return Character, Codigo completo da filial ativa
+/*/
+Static Function GetCurrentBranch()
+
+    GetCompanyCode()
+
+Return cFilAnt
+
+/*/{Protheus.doc} GetSourceBuild
+Retorna a versao do monitor e a data/hora do objeto compilado no RPO.
+
+@type static function
+@author Fabio
+@since 28/07/2026
+@version 1.0
+@return Character, Identificacao da versao compilada
+/*/
+Static Function GetSourceBuild()
+
+    Local aInfo          := GetApoInfo("SUPNFMON.TLPP")                         as Array
+    Local cBuild         := "v" + SUPNFMON_VERSION +;
+        " | RPO: data indisponivel"                                            as Character
+
+    If ValType(aInfo) == "A"
+        If Len(aInfo) >= 4
+            If ValType(aInfo[4]) == "D" .And. !Empty(aInfo[4])
+                cBuild              := "v" + SUPNFMON_VERSION +;
+                    " | RPO: " + DToC(aInfo[4])
+
+                If Len(aInfo) >= 5
+                    If ValType(aInfo[5]) == "C" .And. !Empty(aInfo[5])
+                        cBuild              += " " + AllTrim(aInfo[5])
+                    EndIf
+                EndIf
+            EndIf
+        EndIf
+    EndIf
+
+Return cBuild
+
+/*/{Protheus.doc} BuildQuery
+Monta a consulta otimizada das notas fiscais do monitor Mais Vendas.
+
+A consulta restringe empresa, filial e periodo antes de entregar os dados ao
+browse. Os filtros dinamicos sao preparados e a situacao usa a mesma classe de
+legenda exibida na grade.
+
+@param cInvoice, Character, Numero ou parte do numero da nota fiscal
+@param cBranch, Character, Filial de origem selecionada
+@param dDateFrom, Date, Data inicial de emissao ou data vazia
+@param dDateTo, Date, Data final de emissao ou data vazia
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 3.5
+@return Character, Consulta compativel com o banco de dados atual
+/*/
+Static Function BuildQuery(cInvoice, cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+    Local cCompanyBranch := ""                                                  as Character
+    Local cLegendFilter  := ""                                                  as Character
+    Local cQuery         := ""                                                  as Character
+    Local cUsrFilFilter  := FWSQLUsrFilial("SF2")                               as Character
+    Local lFilterDateFrom := .F.                                                as Logical
+    Local lFilterDateTo  := .F.                                                 as Logical
+    Local lFilterDoc     := .F.                                                 as Logical
+    Local lFilterStatus  := .F.                                                 as Logical
+    Local nParam         := 0                                                   as Numeric
+    Local oStatement     := Nil                                                 as Object
+
+    Default cInvoice     := ""
+    Default cBranch      := ""
+    Default dDateFrom    := CToD("")
+    Default dDateTo      := CToD("")
+    Default cStatusFilter := FILTER_ALL
+
+    cCompanyBranch       := GetCompanyCode() + AllTrim(cBranch)
+    cLegendFilter        := GetLegendFilter(cStatusFilter)
+    lFilterDateFrom      := !Empty(dDateFrom)
+    lFilterDateTo        := !Empty(dDateTo)
+    lFilterDoc           := !Empty(AllTrim(cInvoice))
+    lFilterStatus        := !Empty(cLegendFilter)
+
+    // O SELECT externo permite filtrar pela classificacao calculada sem
+    // duplicar as regras funcionais na clausula WHERE.
+    cQuery               := " SELECT MON.* FROM ( "
+    cQuery               += " SELECT "
+    cQuery               += " SF2.F2_FILIAL AS FILORIG, "
+    cQuery               += " SF2.F2_FILIAL, SF2.F2_DOC, SF2.F2_SERIE, "
+    cQuery               += " SF2.F2_CLIENTE, SF2.F2_LOJA, SF2.F2_EMISSAO, "
+    cQuery               += " SF2.F2_VALBRUT, SF2.F2_COND, SF2.F2_CHVNFE, "
+    cQuery               += " SF2.R_E_C_N_O_ AS RECF2, "
+    cQuery               += " SA1.A1_NOME, SA1.A1_CGC, "
+    cQuery               += " INV.R_E_C_N_O_ AS RECINV, INV.SUP_CODINV, "
+    cQuery               += " INV.SUP_CODTRA, INV.SUP_STATUS, INV.SUP_PROCFI, "
+    cQuery               += " INV.SUP_CONENT, INV.SUP_DATENT, INV.SUP_DTLENT, "
+    cQuery               += " CASE "
+    cQuery               += " WHEN INV.SUP_STATUS IN ('2', '4', '5') THEN 'C' "
+    cQuery               += " WHEN INV.SUP_STATUS = 'X' THEN 'E' "
+    cQuery               += " WHEN INV.SUP_STATUS = '1' "
+    cQuery               += " AND INV.SUP_CONENT = 'X' "
+    cQuery               += " AND (INV.SUP_DATENT IS NULL OR INV.SUP_DATENT = ' ') "
+    cQuery               += " THEN 'P' "
+    cQuery               += " WHEN INV.SUP_STATUS = '1' "
+    cQuery               += " AND INV.SUP_PROCFI = '2' THEN 'E' "
+    cQuery               += " WHEN INV.SUP_STATUS = '1' "
+    cQuery               += " AND INV.SUP_PROCFI = '1' THEN 'O' "
+    cQuery               += " ELSE 'P' END AS LEGSTATUS "
+    cQuery               += " FROM " + RetSqlName("SF2") + " SF2 "
+    cQuery               += " INNER JOIN " + RetSqlName("SA1") + " SA1 "
+    cQuery               += " ON " + FWJoinFilial("SA1", "SF2")
+    cQuery               += " AND SA1.A1_COD = SF2.F2_CLIENTE "
+    cQuery               += " AND SA1.A1_LOJA = SF2.F2_LOJA "
+    cQuery               += " AND SA1.D_E_L_E_T_ = ' ' "
+
+    // SUP_COMP recebe empresa + filial na gravacao da SUPPAYINVOICE. A
+    // igualdade direta permite que o banco utilize um indice nesse campo.
+    cQuery               += " LEFT JOIN SUPPAYINVOICE INV "
+    cQuery               += " ON INV.SUP_COMP = ? "
+    cQuery               += " AND INV.SUP_DOC = SF2.F2_DOC "
+    cQuery               += " AND INV.SUP_SERINF = SF2.F2_SERIE "
+    cQuery               += " AND INV.D_E_L_E_T_ = ' ' "
+    cQuery               += " AND INV.R_E_C_N_O_ = (SELECT MAX(IN2.R_E_C_N_O_) "
+    cQuery               += " FROM SUPPAYINVOICE IN2 "
+    cQuery               += " WHERE IN2.SUP_COMP = INV.SUP_COMP "
+    cQuery               += " AND IN2.SUP_DOC = INV.SUP_DOC "
+    cQuery               += " AND IN2.SUP_SERINF = INV.SUP_SERINF "
+    cQuery               += " AND IN2.D_E_L_E_T_ = ' ') "
+    cQuery               += " WHERE SF2.D_E_L_E_T_ = ' ' "
+    cQuery               += " AND SF2.F2_FILIAL = ? "
+
+    // Mantem a restricao de acesso definida no configurador do Protheus.
+    If !Empty(cUsrFilFilter)
+        cQuery               += " AND " + cUsrFilFilter + " "
+    EndIf
+
+    If lFilterDateFrom
+        cQuery               += " AND SF2.F2_EMISSAO >= ? "
+    EndIf
+
+    If lFilterDateTo
+        cQuery               += " AND SF2.F2_EMISSAO <= ? "
+    EndIf
+
+    cQuery               += " AND EXISTS (SELECT 1 "
+    cQuery               += " FROM " + RetSqlName("SD2") + " SD2 "
+    cQuery               += " INNER JOIN " + RetSqlName("SC5") + " SC5 "
+    cQuery               += " ON " + FWJoinFilial("SC5", "SD2")
+    cQuery               += " AND SC5.C5_NUM = SD2.D2_PEDIDO "
+    cQuery               += " AND SC5.D_E_L_E_T_ = ' ' "
+    cQuery               += " INNER JOIN " + RetSqlName("SE4") + " SE4 "
+    cQuery               += " ON " + FWJoinFilial("SE4", "SC5")
+    cQuery               += " AND SE4.E4_CODIGO = SC5.C5_CONDPAG "
+    cQuery               += " AND SE4.E4_XSUPPAY = 'S' "
+    cQuery               += " AND SE4.D_E_L_E_T_ = ' ' "
+    cQuery               += " WHERE " + FWJoinFilial("SD2", "SF2")
+    cQuery               += " AND SD2.D2_DOC = SF2.F2_DOC "
+    cQuery               += " AND SD2.D2_SERIE = SF2.F2_SERIE "
+    cQuery               += " AND SD2.D2_CLIENTE = SF2.F2_CLIENTE "
+    cQuery               += " AND SD2.D2_LOJA = SF2.F2_LOJA "
+    cQuery               += " AND SD2.D2_TIPO = 'N' "
+    cQuery               += " AND SD2.D_E_L_E_T_ = ' ') "
+
+    If lFilterDoc
+        cQuery               += " AND SF2.F2_DOC LIKE ? "
+    EndIf
+
+    cQuery               += " ) MON "
+
+    If lFilterStatus
+        cQuery               += " WHERE MON.LEGSTATUS = ? "
+    EndIf
+
+    cQuery               += " ORDER BY MON.F2_EMISSAO DESC, MON.F2_DOC DESC, "
+    cQuery               += " MON.F2_SERIE DESC, MON.RECF2 DESC, MON.RECINV DESC "
+    cQuery               := ChangeQuery(cQuery)
+
+    // Todos os valores variaveis sao tratados pelo statement antes de a
+    // consulta ser entregue ao FWFormBrowse.
+    oStatement           := FWPreparedStatement():New(cQuery)
+
+    nParam++
+    oStatement:SetString(nParam, cCompanyBranch)
+
+    nParam++
+    oStatement:SetString(nParam, AllTrim(cBranch))
+
+    If lFilterDateFrom
+        nParam++
+        oStatement:SetString(nParam, DToS(dDateFrom))
+    EndIf
+
+    If lFilterDateTo
+        nParam++
+        oStatement:SetString(nParam, DToS(dDateTo))
+    EndIf
+
+    If lFilterDoc
+        nParam++
+        oStatement:SetString(nParam, "%" + AllTrim(cInvoice) + "%")
+    EndIf
+
+    If lFilterStatus
+        nParam++
+        oStatement:SetString(nParam, cLegendFilter)
+    EndIf
+
+    cQuery               := oStatement:GetFixQuery()
+    oStatement:Destroy()
+
+Return cQuery
+
+/*/{Protheus.doc} GetLegendFilter
+Traduz a situacao funcional para o codigo de legenda usado pela consulta.
+
+@param cStatusFilter, Character, Situacao selecionada pelo usuario
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Character, Codigo da legenda ou vazio para todas as situacoes
+/*/
+Static Function GetLegendFilter(cStatusFilter)
+
+    Local cLegend        := ""                                                  as Character
+
+    Do Case
+    Case cStatusFilter == FILTER_ERROR
+        cLegend              := "E"
+    Case cStatusFilter == FILTER_PENDING
+        cLegend              := "P"
+    Case cStatusFilter == FILTER_PROCESSED
+        cLegend              := "O"
+    Case cStatusFilter == FILTER_CANCELED
+        cLegend              := "C"
+    EndCase
+
+Return cLegend
+
+/*/{Protheus.doc} ShowBrowse
+Apresenta o monitor de notas fiscais Mais Vendas em modo somente leitura.
+
+@param cAlias, Character, Alias que sera utilizado pelo browse
+@param cQuery, Character, Consulta que alimentara o browse
+@param cBranch, Character, Filial atualmente exibida pelo monitor
+@param dDateFrom, Date, Data inicial do periodo consultado
+@param dDateTo, Date, Data final do periodo consultado
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 3.5
+@return Nil
+/*/
+Static Function ShowBrowse(cAlias, cQuery, cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+    Local aColumns       := BuildBrowseColumns(cAlias)                          as Array
+    Local aSearch        := BuildSearchConfig()                                 as Array
+    Local oBrowse        := Nil                                                 as Object
+    Local oModal         := Nil                                                 as Object
+
+    oModal               := FWDialogModal():New()
+    oModal:SetEscClose(.T.)
+    oModal:SetTitle(GetMonitorTitle(;
+        cBranch,;
+        dDateFrom,;
+        dDateTo,;
+        cStatusFilter;
+    ))
+    oModal:EnableFormBar(.F.)
+    oModal:EnableAllClient()
+    oModal:CreateDialog()
+
+    oBrowse              := FWFormBrowse():New()
+    oBrowse:SetOwner(oModal:GetPanelMain())
+    oBrowse:SetDataQuery()
+    oBrowse:SetAlias(cAlias)
+    oBrowse:SetQueryIndex(aSearch[1])
+    oBrowse:SetQuery(cQuery)
+    oBrowse:SetSeek(, aSearch[2])
+    oBrowse:SetUseFilter(.T.)
+    oBrowse:SetProfileID(SUPNFMON_PROFILE)
+    oBrowse:SetDescription("Notas Fiscais Mais Vendas")
+    oBrowse:SetColumns(aColumns)
+
+    AddBrowseLegends(oBrowse)
+    AddBrowseButtons(;
+        oBrowse,;
+        oModal,;
+        @cBranch,;
+        @dDateFrom,;
+        @dDateTo,;
+        @cStatusFilter;
+    )
+
+    oBrowse:Activate()
+    oModal:Activate()
+
+Return Nil
+
+/*/{Protheus.doc} BuildSearchConfig
+Monta os campos de pesquisa exibidos pelo FWFormBrowse.
+
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Indices da consulta e metadados das pesquisas
+/*/
+Static Function BuildSearchConfig()
+
+    Local aIndex         := {}                                                  as Array
+    Local aSeek          := {}                                                  as Array
+
+    aAdd(aIndex, "F2_DOC")
+    aAdd(aSeek, { "Número da NF", { { "", "C", TamSx3("F2_DOC")[1], 0,;
+        "Número da NF", "@!" } }, 1, .T. })
+
+    aAdd(aIndex, "FILORIG")
+    aAdd(aSeek, { "Filial de Origem", { { "", "C", TamSx3("F2_FILIAL")[1], 0,;
+        "Filial de Origem", "@!" } }, 2, .T. })
+
+    aAdd(aIndex, "A1_CGC")
+    aAdd(aSeek, { "CPF / CNPJ", { { "", "C", TamSx3("A1_CGC")[1], 0,;
+        "CPF / CNPJ", "@!" } }, 3, .T. })
+
+    aAdd(aIndex, "SUP_CODINV")
+    aAdd(aSeek, { "Código da Implantação", { { "", "C", 8, 0,;
+        "Código da Implantação", "@!" } }, 4, .T. })
+
+    aAdd(aIndex, "SUP_CODTRA")
+    aAdd(aSeek, { "Código da Transação", { { "", "C", 20, 0,;
+        "Código da Transação", "@!" } }, 5, .T. })
+
+    aAdd(aIndex, "F2_CHVNFE")
+    aAdd(aSeek, { "Chave da NF-e", { { "", "C", TamSx3("F2_CHVNFE")[1], 0,;
+        "Chave da NF-e", "@!" } }, 6, .T. })
+
+Return { aIndex, aSeek }
+
+/*/{Protheus.doc} BuildBrowseColumns
+Monta as colunas do monitor por grupos funcionais.
+
+@param cAlias, Character, Alias da consulta
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Colunas configuradas para o browse
+/*/
+Static Function BuildBrowseColumns(cAlias)
+
+    Local aColumns       := {}                                                  as Array
+
+    aColumns             := AddStatusColumns(aColumns, cAlias)
+    aColumns             := AddInvoiceColumns(aColumns, cAlias)
+    aColumns             := AddCustomerColumns(aColumns, cAlias)
+    aColumns             := AddCommercialColumns(aColumns, cAlias)
+    aColumns             := AddIntegrationColumns(aColumns, cAlias)
+
+Return aColumns
+
+/*/{Protheus.doc} AddStatusColumns
+Adiciona as colunas de situacao do fluxo Mais Vendas.
+
+@param aColumns, Array, Colunas ja configuradas
+@param cAlias, Character, Alias da consulta
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Colunas atualizadas
+/*/
+Static Function AddStatusColumns(aColumns, cAlias)
+
+    aAdd(aColumns, NewColumn(;
+        "Status Mais Vendas", {|| GetStatus(cAlias)}, "C", 28, 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Faturamento", {|| GetBillingStatus(cAlias)}, "C", 20, 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Financeiro", {|| GetFinancialStatus(cAlias)}, "C", 18, 0, "@!";
+    ))
+
+Return aColumns
+
+/*/{Protheus.doc} AddInvoiceColumns
+Adiciona as colunas de identificacao da nota fiscal.
+
+@param aColumns, Array, Colunas ja configuradas
+@param cAlias, Character, Alias da consulta
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Colunas atualizadas
+/*/
+Static Function AddInvoiceColumns(aColumns, cAlias)
+
+    aAdd(aColumns, NewColumn(;
+        "Filial de Origem", {|| (cAlias)->FILORIG},;
+        "C", TamSx3("F2_FILIAL")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Nota Fiscal", {|| (cAlias)->F2_DOC},;
+        "C", TamSx3("F2_DOC")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Série", {|| (cAlias)->F2_SERIE},;
+        "C", TamSx3("F2_SERIE")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Emissão", {|| StoD((cAlias)->F2_EMISSAO)}, "D", 8, 0, "@D";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Chave da NF-e", {|| (cAlias)->F2_CHVNFE},;
+        "C", TamSx3("F2_CHVNFE")[1], 0, "@!";
+    ))
+
+Return aColumns
+
+/*/{Protheus.doc} AddCustomerColumns
+Adiciona as colunas de identificacao do cliente.
+
+@param aColumns, Array, Colunas ja configuradas
+@param cAlias, Character, Alias da consulta
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Colunas atualizadas
+/*/
+Static Function AddCustomerColumns(aColumns, cAlias)
+
+    aAdd(aColumns, NewColumn(;
+        "Cliente", {|| (cAlias)->F2_CLIENTE},;
+        "C", TamSx3("F2_CLIENTE")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Loja", {|| (cAlias)->F2_LOJA},;
+        "C", TamSx3("F2_LOJA")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Nome do Cliente", {|| (cAlias)->A1_NOME},;
+        "C", TamSx3("A1_NOME")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "CPF / CNPJ", {|| (cAlias)->A1_CGC},;
+        "C", TamSx3("A1_CGC")[1], 0, "@!";
+    ))
+
+Return aColumns
+
+/*/{Protheus.doc} AddCommercialColumns
+Adiciona as informacoes comerciais da nota fiscal.
+
+@param aColumns, Array, Colunas ja configuradas
+@param cAlias, Character, Alias da consulta
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Colunas atualizadas
+/*/
+Static Function AddCommercialColumns(aColumns, cAlias)
+
+    aAdd(aColumns, NewColumn(;
+        "Condição", {|| (cAlias)->F2_COND},;
+        "C", TamSx3("F2_COND")[1], 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Valor da NF", {|| (cAlias)->F2_VALBRUT}, "N",;
+        TamSx3("F2_VALBRUT")[1], TamSx3("F2_VALBRUT")[2],;
+        "@E 999,999,999.99";
+    ))
+
+Return aColumns
+
+/*/{Protheus.doc} AddIntegrationColumns
+Adiciona as informacoes de controle da integracao Mais Vendas.
+
+@param aColumns, Array, Colunas ja configuradas
+@param cAlias, Character, Alias da consulta
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Array, Colunas atualizadas
+/*/
+Static Function AddIntegrationColumns(aColumns, cAlias)
+
+    aAdd(aColumns, NewColumn(;
+        "Limite de Entrega", {|| StoD((cAlias)->SUP_DTLENT)},;
+        "D", 8, 0, "@D";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Código da Implantação", {|| (cAlias)->SUP_CODINV},;
+        "C", 8, 0, "@!";
+    ))
+    aAdd(aColumns, NewColumn(;
+        "Código da Transação", {|| (cAlias)->SUP_CODTRA},;
+        "C", 20, 0, "@!";
+    ))
+
+Return aColumns
+
+/*/{Protheus.doc} AddBrowseLegends
+Configura as legendas funcionais do monitor.
+
+@param oBrowse, Object, Browse de notas fiscais
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Nil
+/*/
+Static Function AddBrowseLegends(oBrowse)
+
+    oBrowse:AddLegend(;
+        "LEGSTATUS == 'O'",;
+        "BR_VERDE",;
+        "Tudo OK: faturamento e financeiro processados";
+    )
+    oBrowse:AddLegend(;
+        "LEGSTATUS == 'E'",;
+        "BR_VERMELHO",;
+        "Erro no faturamento ou no financeiro";
+    )
+    oBrowse:AddLegend(;
+        "LEGSTATUS == 'C'",;
+        "BR_CINZA",;
+        "Nota cancelada ou excluída";
+    )
+    oBrowse:AddLegend(;
+        "LEGSTATUS == 'P'",;
+        "BR_AMARELO",;
+        "Pendente, aguardando envio, entrega ou implantação";
+    )
+
+Return Nil
+
+/*/{Protheus.doc} AddBrowseButtons
+Configura as acoes disponiveis na barra do monitor.
+
+@param oBrowse, Object, Browse de notas fiscais
+@param oModal, Object, Janela principal do monitor
+@param cBranch, Character, Filial atualmente exibida
+@param dDateFrom, Date, Data inicial do periodo
+@param dDateTo, Date, Data final do periodo
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Nil
+/*/
+Static Function AddBrowseButtons(oBrowse, oModal, cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+    oBrowse:AddButton(;
+        "Filtros",;
+        {|| ChangeFilters(;
+            oBrowse,;
+            oModal,;
+            cBranch,;
+            @dDateFrom,;
+            @dDateTo,;
+            @cStatusFilter;
+        )},;
+        ,,,;
+        .F.;
+    )
+    oBrowse:AddButton(;
+        "Trocar Filial",;
+        {|| cBranch := ChangeBranch(;
+            oBrowse,;
+            oModal,;
+            cBranch,;
+            dDateFrom,;
+            dDateTo,;
+            cStatusFilter;
+        )},;
+        ,,,;
+        .F.;
+    )
+    oBrowse:AddButton(;
+        "Atualizar",;
+        {|| RefreshBrowse(;
+            oBrowse,;
+            cBranch,;
+            dDateFrom,;
+            dDateTo,;
+            cStatusFilter;
+        )},;
+        ,,,;
+        .F.;
+    )
+    oBrowse:AddButton("Legenda", {|| ShowLegendHelp()},,,,.F.)
+
+Return Nil
+
+/*/{Protheus.doc} ChangeFilters
+Permite alterar o periodo e a situacao sem reabrir o monitor.
+
+Datas vazias consultam o historico completo. A consulta somente e atualizada
+quando os parametros informados forem validos.
+
+@param oBrowse, Object, Browse de notas fiscais
+@param oModal, Object, Janela principal do monitor
+@param cBranch, Character, Filial atualmente exibida
+@param dDateFrom, Date, Data inicial do periodo
+@param dDateTo, Date, Data final do periodo
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Logical, Indica se os filtros foram aplicados
+/*/
+Static Function ChangeFilters(oBrowse, oModal, cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+    Local aParams        := {}                                                  as Array
+    Local aResult        := {}                                                  as Array
+    Local aStatusOptions := {;
+        FILTER_ALL,;
+        FILTER_ERROR,;
+        FILTER_PENDING,;
+        FILTER_PROCESSED,;
+        FILTER_CANCELED;
+    }                                                                           as Array
+
+    aAdd(aParams, {;
+        1, "Emissão de (vazio = histórico)", dDateFrom, "", "", "", "", 100, .T.;
+    })
+    aAdd(aParams, {;
+        1, "Emissão até (vazio = histórico)", dDateTo, "", "", "", "", 100, .T.;
+    })
+    aAdd(aParams, {;
+        2, "Situação", cStatusFilter, aStatusOptions, 100, ".T.", .T.;
+    })
+
+    If !ParamBox(aParams, "Filtros do Monitor", @aResult, {|| .T.})
+        Return .F.
+    EndIf
+
+    If !Empty(aResult[1]) .And. !Empty(aResult[2])
+        If aResult[1] > aResult[2]
+            FWAlertInfo(;
+                "A data inicial não pode ser maior que a data final.",;
+                "Filtros do Monitor";
+            )
+
+            Return .F.
+        EndIf
+    EndIf
+
+    dDateFrom            := aResult[1]
+    dDateTo              := aResult[2]
+    cStatusFilter        := aResult[3]
+
+    RefreshBrowse(;
+        oBrowse,;
+        cBranch,;
+        dDateFrom,;
+        dDateTo,;
+        cStatusFilter;
+    )
+    oModal:SetTitle(GetMonitorTitle(;
+        cBranch,;
+        dDateFrom,;
+        dDateTo,;
+        cStatusFilter;
+    ))
+
+Return .T.
+
+/*/{Protheus.doc} ChangeBranch
+Permite selecionar uma filial autorizada e atualiza os dados do monitor.
+
+A troca afeta apenas a consulta desta tela. A filial do ambiente Protheus
+permanece inalterada e os filtros atuais sao preservados.
+
+@param oBrowse, Object, Browse de notas fiscais
+@param oModal, Object, Janela principal do monitor
+@param cBranch, Character, Filial atualmente exibida
+@param dDateFrom, Date, Data inicial do periodo
+@param dDateTo, Date, Data final do periodo
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 30/07/2026
+@version 1.1
+@return Character, Filial que permanece selecionada no monitor
+/*/
+Static Function ChangeBranch(oBrowse, oModal, cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+    Local aBranches      := FwListBranches(;
+        .T.,;
+        .F.,;
+        .T.,;
+        { "SM0_CODFIL", "SM0_NOMRED" };
+    )                                                                           as Array
+    Local cNewBranch     := cBranch                                             as Character
+
+    If Empty(aBranches)
+        Return cBranch
+    EndIf
+
+    If Len(aBranches) != 1
+        FWAlertInfo(;
+            "Selecione somente uma filial para visualizar no monitor.",;
+            "Trocar Filial";
+        )
+
+        Return cBranch
+    EndIf
+
+    If ValType(aBranches[1]) != "A" .Or. Len(aBranches[1]) < 1
+        FWAlertError(;
+            "Não foi possível identificar a filial selecionada.",;
+            "Trocar Filial";
+        )
+
+        Return cBranch
+    EndIf
+
+    cNewBranch           := AllTrim(aBranches[1][1])
+
+    If Empty(cNewBranch) .Or. cNewBranch == AllTrim(cBranch)
+        Return cBranch
+    EndIf
+
+    RefreshBrowse(;
+        oBrowse,;
+        cNewBranch,;
+        dDateFrom,;
+        dDateTo,;
+        cStatusFilter;
+    )
+    oModal:SetTitle(GetMonitorTitle(;
+        cNewBranch,;
+        dDateFrom,;
+        dDateTo,;
+        cStatusFilter;
+    ))
+
+Return cNewBranch
+
+/*/{Protheus.doc} RefreshBrowse
+Reconstroi a consulta e atualiza o browse preservando os filtros atuais.
+
+@param oBrowse, Object, Browse de notas fiscais
+@param cBranch, Character, Filial atualmente exibida
+@param dDateFrom, Date, Data inicial do periodo
+@param dDateTo, Date, Data final do periodo
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Nil
+/*/
+Static Function RefreshBrowse(oBrowse, cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+    Local oError         := Nil                                                 as Object
+
+    CursorWait()
+
+    Try
+        oBrowse:SetQuery(BuildQuery(;
+            "",;
+            cBranch,;
+            dDateFrom,;
+            dDateTo,;
+            cStatusFilter;
+        ))
+        oBrowse:Refresh(.T.)
+    Catch oError
+        UserException(;
+            "Não foi possível atualizar os dados do monitor: " +;
+            AllTrim(oError:Description);
+        )
+    Finally
+        CursorArrow()
+    EndTry
+
+Return Nil
+
+/*/{Protheus.doc} GetMonitorTitle
+Monta o titulo da janela com filial, periodo e situacao exibidos.
+
+@param cBranch, Character, Filial atualmente exibida
+@param dDateFrom, Date, Data inicial do periodo
+@param dDateTo, Date, Data final do periodo
+@param cStatusFilter, Character, Situacao funcional selecionada
+@type static function
+@author Fabio
+@since 30/07/2026
+@version 1.1
+@return Character, Titulo completo da janela
+/*/
+Static Function GetMonitorTitle(cBranch, dDateFrom, dDateTo, cStatusFilter)
+
+Return "Monitor Mais Vendas | Filial " + AllTrim(cBranch) + " | " +;
+    GetPeriodDescription(dDateFrom, dDateTo) + " | " + cStatusFilter +;
+    " | " + GetSourceBuild()
+
+/*/{Protheus.doc} GetPeriodDescription
+Retorna a descricao do periodo atualmente consultado.
+
+@param dDateFrom, Date, Data inicial do periodo
+@param dDateTo, Date, Data final do periodo
+@type static function
+@author Fabio
+@since 03/08/2026
+@version 1.0
+@return Character, Descricao amigavel do periodo
+/*/
+Static Function GetPeriodDescription(dDateFrom, dDateTo)
+
+    Local cDescription   := "Todo o histórico"                                 as Character
+
+    If !Empty(dDateFrom) .And. !Empty(dDateTo)
+        cDescription         := DToC(dDateFrom) + " a " + DToC(dDateTo)
+    ElseIf !Empty(dDateFrom)
+        cDescription         := "Desde " + DToC(dDateFrom)
+    ElseIf !Empty(dDateTo)
+        cDescription         := "Até " + DToC(dDateTo)
+    EndIf
+
+Return cDescription
+
+/*/{Protheus.doc} ShowLegendHelp
+Apresenta a traducao completa das cores utilizadas no monitor.
+
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 3.0
+@return Nil
+/*/
+Static Function ShowLegendHelp()
+
+    Local aLegend        := {;
+        { "BR_VERDE", "Tudo OK - faturamento e financeiro processados." },;
+        { "BR_VERMELHO", "Erro no faturamento ou no processamento financeiro." },;
+        { "BR_CINZA", "Nota cancelada ou excluída." },;
+        { "BR_AMARELO", "Aguardando envio, entrega, financeiro ou implantação." };
+    }                                                                           as Array
+
+    BrwLegenda("Monitor Mais Vendas", "Legenda", aLegend)
+
+Return Nil
+
+/*/{Protheus.doc} NewColumn
+Cria e configura uma coluna para o browse do monitor.
+
+@param cTitle, Character, Titulo apresentado no cabecalho
+@param bData, CodeBlock, Bloco que retorna o conteudo da coluna
+@param cType, Character, Tipo do dado
+@param nSize, Numeric, Tamanho do campo
+@param nDecimal, Numeric, Quantidade de casas decimais
+@param cPicture, Character, Mascara de apresentacao
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 1.0
+@return Object, Coluna configurada
+/*/
+Static Function NewColumn(cTitle, bData, cType, nSize, nDecimal, cPicture)
+
+    Local oColumn        := Nil                                                 as Object
+
+    oColumn              := FWBrwColumn():New()
+
+    oColumn:SetTitle(cTitle)
+    oColumn:SetData(bData)
+    oColumn:SetType(cType)
+    oColumn:SetSize(nSize)
+    oColumn:SetDecimal(nDecimal)
+
+    If !Empty(cPicture)
+        oColumn:SetPicture(cPicture)
+    EndIf
+
+Return oColumn
+
+/*/{Protheus.doc} GetStatus
+Retorna a descricao do status da nota fiscal no fluxo Mais Vendas.
+
+A ordem das validacoes representa a precedencia funcional dos status.
+
+@param cAlias, Character, Alias posicionado na nota fiscal
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 3.0
+@return Character, Descricao do status
+/*/
+Static Function GetStatus(cAlias)
+
+    Local cResult        := "Status nao mapeado"                                as Character
+    Local cStatus        := AllTrim((cAlias)->SUP_STATUS)                       as Character
+    Local cProcFin       := AllTrim((cAlias)->SUP_PROCFI)                       as Character
+    Local cConEnt        := AllTrim((cAlias)->SUP_CONENT)                       as Character
+
+    // Sem registro na SUPPAYINVOICE, a nota ainda nao foi implantada.
+    If Empty((cAlias)->RECINV)
+        cResult              := "Não implantada"
+
+    // Situacoes encerradas possuem prioridade sobre o financeiro.
+    ElseIf cStatus == "2" .Or. cStatus == "4" .Or. cStatus == "5"
+        cResult              := "Cancelada/Excluída"
+
+    // Erro ocorrido durante o faturamento.
+    ElseIf cStatus == "X"
+        cResult              := "Erro no faturamento"
+
+    // A API solicitou uma nova tentativa posterior.
+    ElseIf cStatus == "T"
+        cResult              := "Aguardando Supplier"
+
+    // Registro criado, mas ainda nao enviado ao Mais Vendas.
+    ElseIf cStatus == "0"
+        cResult              := "Aguardando envio"
+
+    // Cliente DDE aguardando a confirmacao da entrega.
+    ElseIf cStatus == "1" .And. cConEnt == "X" .And. Empty((cAlias)->SUP_DATENT)
+        cResult              := "DDE - Aguardando entrega"
+
+    // Faturamento processado e financeiro ainda pendente.
+    ElseIf cStatus == "1" .And. (cProcFin == "0" .Or. Empty(cProcFin))
+        cResult              := "Aguardando financeiro"
+
+    // Faturamento processado e financeiro com erro.
+    ElseIf cStatus == "1" .And. cProcFin == "2"
+        cResult              := "Erro no financeiro"
+
+    // Implantacao concluida no faturamento e no financeiro.
+    ElseIf cStatus == "1" .And. cProcFin == "1"
+        cResult              := "Implantada"
+    Else
+        cResult              := "Não mapeado (" + cStatus + ")"
+    EndIf
+
+Return cResult
+
+/*/{Protheus.doc} GetBillingStatus
+Traduz o codigo tecnico do faturamento para uma descricao funcional.
+
+@param cAlias, Character, Alias posicionado na nota fiscal
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 3.0
+@return Character, Descricao do status do faturamento
+/*/
+Static Function GetBillingStatus(cAlias)
+
+    Local cResult        := "Status nao mapeado"                                as Character
+    Local cStatus        := AllTrim((cAlias)->SUP_STATUS)                       as Character
+
+    If Empty((cAlias)->RECINV)
+        cResult              := "Não implantado"
+    ElseIf Empty(cStatus)
+        cResult              := "Não iniciado"
+    ElseIf cStatus == "0"
+        cResult              := "Aguardando envio"
+    ElseIf cStatus == "1"
+        cResult              := "Processado"
+    ElseIf cStatus == "2"
+        cResult              := "Cancelado"
+    ElseIf cStatus == "4"
+        cResult              := "Excluído"
+    ElseIf cStatus == "5"
+        cResult              := "Cancelado/Excluído"
+    ElseIf cStatus == "T"
+        cResult              := "Aguardando Supplier"
+    ElseIf cStatus == "X"
+        cResult              := "Erro"
+    Else
+        cResult              := "Não mapeado (" + cStatus + ")"
+    EndIf
+
+Return cResult
+
+/*/{Protheus.doc} GetFinancialStatus
+Traduz o codigo tecnico do financeiro para uma descricao funcional.
+
+@param cAlias, Character, Alias posicionado na nota fiscal
+@type static function
+@author Fabio
+@since 27/07/2026
+@version 3.0
+@return Character, Descricao do status do financeiro
+/*/
+Static Function GetFinancialStatus(cAlias)
+
+    Local cResult        := "Status nao mapeado"                                as Character
+    Local cProcFin       := AllTrim((cAlias)->SUP_PROCFI)                       as Character
+
+    If Empty((cAlias)->RECINV)
+        cResult              := "Não implantado"
+    ElseIf Empty(cProcFin)
+        cResult              := "Não iniciado"
+    ElseIf cProcFin == "0"
+        cResult              := "Aguardando"
+    ElseIf cProcFin == "1"
+        cResult              := "Processado"
+    ElseIf cProcFin == "2"
+        cResult              := "Erro"
+    Else
+        cResult              := "Não mapeado (" + cProcFin + ")"
+    EndIf
+
+Return cResult
